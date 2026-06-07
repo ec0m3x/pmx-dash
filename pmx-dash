@@ -321,6 +321,50 @@ def render_lxc(containers: list[dict]) -> Panel:
 
     return Panel(table, title="[bold bright_yellow]LXC Containers", border_style="yellow", box=box.SIMPLE_HEAVY)
 
+
+def render_processes(n: int = 15) -> Panel:
+    try:
+        procs = []
+        for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent", "status", "username"]):
+            try:
+                procs.append(p.info)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        procs.sort(key=lambda x: x.get("cpu_percent") or 0, reverse=True)
+        procs = procs[:n]
+    except Exception:
+        procs = []
+
+    table = Table(
+        box=box.SIMPLE,
+        show_header=True,
+        header_style="bold bright_white",
+        expand=True,
+        padding=(0, 1),
+    )
+    table.add_column("PID", justify="right", style="bright_black", width=7)
+    table.add_column("Name", style="bright_white", max_width=22, no_wrap=True)
+    table.add_column("User", style="bright_black", max_width=10, no_wrap=True)
+    table.add_column("CPU%", justify="right", width=6)
+    table.add_column("MEM%", justify="right", width=6)
+    table.add_column("Status", width=8)
+
+    for p in procs:
+        cpu = p.get("cpu_percent") or 0.0
+        mem = p.get("memory_percent") or 0.0
+        status = p.get("status") or ""
+        status_style = "bright_black" if status in ("sleeping", "idle") else "bright_white"
+        table.add_row(
+            str(p.get("pid", "")),
+            str(p.get("name", ""))[:22],
+            str(p.get("username") or "")[:10],
+            Text(f"{cpu:.1f}", style=_pct_color(cpu)),
+            Text(f"{mem:.1f}", style=_pct_color(mem * 5)),
+            Text(status[:8], style=status_style),
+        )
+
+    return Panel(table, title="[bold bright_white]Processes", border_style="white", box=box.SIMPLE_HEAVY)
+
 # ── layout ───────────────────────────────────────────────────────────────────────
 
 def make_layout() -> Layout:
@@ -329,7 +373,7 @@ def make_layout() -> Layout:
         Layout(name="header", size=1),
         Layout(name="top", ratio=5),
         Layout(name="mid", size=6),
-        Layout(name="bottom", ratio=2),
+        Layout(name="bottom", ratio=3),
     )
     layout["top"].split_row(
         Layout(name="cpu", ratio=3),
@@ -338,6 +382,10 @@ def make_layout() -> Layout:
     layout["mid"].split_row(
         Layout(name="memory", ratio=3),
         Layout(name="network", ratio=2),
+    )
+    layout["bottom"].split_row(
+        Layout(name="lxc", ratio=2),
+        Layout(name="processes", ratio=3),
     )
     return layout
 
@@ -358,7 +406,8 @@ def update(layout: Layout, lxc_cache: list, lxc_tick: list[int], gpu_cache: list
     layout["gpu"].update(render_gpu(gpu_cache[0]))
     layout["memory"].update(render_memory())
     layout["network"].update(render_network())
-    layout["bottom"].update(render_lxc(lxc_cache))
+    layout["lxc"].update(render_lxc(lxc_cache))
+    layout["processes"].update(render_processes())
 
 
 def main() -> None:
