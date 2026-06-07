@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
-"""PMX01 Dashboard — btop-style terminal monitor with GPU support."""
+"""pmx-dash — btop-style Proxmox terminal dashboard with GPU support.
 
+Usage:
+    pmx-dash [--iface IFACE]
+
+Options:
+    --iface   Network interface to monitor (default: auto-detect first non-lo)
+"""
+
+import argparse
 import json
 import subprocess
 import time
@@ -16,7 +24,17 @@ from rich.table import Table
 from rich.text import Text
 
 REFRESH = 1.0
-NET_IFACE = "vmbr0"
+
+def _detect_iface() -> str:
+    for iface, stats in psutil.net_io_counters(pernic=True).items():
+        if iface not in ("lo",) and not iface.startswith("veth"):
+            return iface
+    return "eth0"
+
+_parser = argparse.ArgumentParser(description="Proxmox terminal dashboard")
+_parser.add_argument("--iface", default=None, help="Network interface (default: auto-detect)")
+_args = _parser.parse_args()
+NET_IFACE = _args.iface or _detect_iface()
 
 # ── helpers ──────────────────────────────────────────────────────────────────────
 
@@ -136,10 +154,29 @@ def get_lxc_containers() -> list[dict]:
 def render_header() -> Text:
     now = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
     uptime = int(time.time() - psutil.boot_time())
+    hostname = _node().upper()
     t = Text(justify="center")
-    t.append("  PMX01  ", style="bold black on bright_cyan")
+    t.append(f"  {hostname}  ", style="bold black on bright_cyan")
     t.append(f"  Proxmox VE   up {_fmt_uptime(uptime)}   {now}  ", style="bright_black")
     return t
+
+
+_cpu_model: str | None = None
+
+def _get_cpu_model() -> str:
+    global _cpu_model
+    if _cpu_model is None:
+        try:
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if line.startswith("model name"):
+                        _cpu_model = line.split(":", 1)[1].strip()
+                        break
+        except Exception:
+            pass
+        if not _cpu_model:
+            _cpu_model = "CPU"
+    return _cpu_model
 
 
 def render_cpu() -> Panel:
@@ -147,16 +184,16 @@ def render_cpu() -> Panel:
     load = psutil.getloadavg()
     overall = psutil.cpu_percent()
     freq = psutil.cpu_freq()
+    n = len(percents)
 
     table = Table.grid(padding=(0, 1), expand=True)
-    table.add_column(justify="right", no_wrap=True)  # label a
-    table.add_column(no_wrap=True)                   # bar a
-    table.add_column(justify="right", no_wrap=True)  # pct a
-    table.add_column(justify="right", no_wrap=True)  # label b
-    table.add_column(no_wrap=True)                   # bar b
-    table.add_column(justify="right", no_wrap=True)  # pct b
+    table.add_column(justify="right", no_wrap=True)
+    table.add_column(no_wrap=True)
+    table.add_column(justify="right", no_wrap=True)
+    table.add_column(justify="right", no_wrap=True)
+    table.add_column(no_wrap=True)
+    table.add_column(justify="right", no_wrap=True)
 
-    n = len(percents)
     half = (n + 1) // 2
     for i in range(half):
         j = i + half
@@ -182,7 +219,7 @@ def render_cpu() -> Panel:
 
     return Panel(
         Group(table, footer),
-        title="[bold bright_cyan]CPU[/]  AMD Ryzen 9 5900XT  32T",
+        title=f"[bold bright_cyan]CPU[/]  {_get_cpu_model()}  {n}T",
         border_style="cyan",
         box=box.SIMPLE_HEAVY,
     )
