@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""PMX01 Dashboard — btop-style terminal monitor with GPU support."""
+
+import json
+import subprocess
+import time
+from datetime import datetime
+
+import psutil
+from rich import box
+from rich.console import Console, Group
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+REFRESH = 1.0
+NET_IFACE = "vmbr0"
+
+# ── helpers ──────────────────────────────────────────────────────────────────────
+
+def _bar(pct: float, width: int = 20) -> Text:
+    filled = max(0, min(width, int(pct / 100 * width)))
+    color = "green" if pct < 50 else "yellow" if pct < 80 else "red"
+    t = Text()
+    t.append("█" * filled, style=color)
+    t.append("░" * (width - filled), style="bright_black")
+    return t
+
+def _pct_color(pct: float) -> str:
+    return "green" if pct < 50 else "yellow" if pct < 80 else "red"
+
+def _fmt_bytes(b: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if b < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.1f} PB"
+
+def _fmt_speed(bps: float) -> str:
+    return _fmt_bytes(bps) + "/s"
+
+def _fmt_uptime(seconds: int) -> str:
+    d, rem = divmod(int(seconds), 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    return f"{d}d {h:02d}h {m:02d}m" if d else f"{h:02d}h {m:02d}m"
+
+# ── data collectors ──────────────────────────────────────────────────────────────
+
+def get_gpu() -> dict | None:
+    try:
+        raw = subprocess.check_output(
+            ["nvidia-smi",
+             "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
+             "--format=csv,noheader,nounits"],
+            timeout=2, stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        p = [x.strip() for x in raw.split(",")]
+        return {
+            "name": p[0],
+            "util": int(p[1]),
+            "mem_used": int(p[2]),
+            "mem_total": int(p[3]),
+            "temp": int(float(p[4])),
+            "power": float(p[5]),
+        }
+    except Exception:
+        return None
+
+
+_net_prev: dict[str, tuple[int, int, float]] = {}
+
+def get_net_speed(iface: str) -> tuple[float, float]:
+    stats = psutil.net_io_counters(pernic=True)
+    if iface not in stats:
+        return 0.0, 0.0
+    now = time.monotonic()
+    cur = stats[iface]
+    if iface in _net_prev:
+        prev_rx, prev_tx, prev_t = _net_prev[iface]
+        dt = now - prev_t
+        rx_s = (cur.bytes_recv - prev_rx) / dt if dt > 0 else 0.0
+        tx_s = (cur.bytes_sent - prev_tx) / dt if dt > 0 else 0.0
+    else:
+        rx_s = tx_s = 0.0
+    _net_prev[iface] = (cur.bytes_recv, cur.bytes_sent, now)
+    return max(0.0, rx_s), max(0.0, tx_s)
+
+
+_node_name: str | None = None
+
+def _node() -> str:
+    global _node_name
+    if _node_name is None:
+        _node_name = subprocess.check_output(
+            ["hostname", "-s"], timeout=2, stderr=subprocess.DEVNULL
+        ).decode().strip()
+    return _node_name
+
+
+def get_lxc_containers() -> list[dict]:
+    try:
+        raw = subprocess.check_output(["pct", "list"], timeout=3, stderr=subprocess.DEVNULL).decode()
+        result = []
+        for line in raw.strip().splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            vmid, status, name = parts[0], parts[1], parts[-1]
+            st = None
+            if status == "running":
+                try:
+                    out = subprocess.check_output(
+                        ["pvesh", "get", f"/nodes/{_node()}/lxc/{vmid}/status/current",
+                         "--output-format", "json"],
+                        timeout=3, stderr=subprocess.DEVNULL,
+                    ).decode()
+                    d = json.loads(out)
+                    st = {
+                        "cpu_pct": round(d.get("cpu", 0) * 100, 1),
+                        "mem": d.get("mem", 0),
+                        "maxmem": d.get("maxmem", 1),
+                        "uptime": d.get("uptime", 0),
+                    }
+                except Exception:
+                    pass
+            result.append({"vmid": vmid, "name": name, "status": status, "stats": st})
+        return result
+    except Exception:
+        return []
+
+# ── renderers ────────────────────────────────────────────────────────────────────
+
+def render_header() -> Text:
+    now = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+    uptime = int(time.time() - psutil.boot_time())
+    t = Text(justify="center")
+    t.append("  PMX01  ", style="bold black on bright_cyan")
+    t.append(f"  Proxmox VE   up {_fmt_uptime(uptime)}   {now}  ", style="bright_black")
+    return t
+
+
+def render_cpu() -> Panel:
+    percents = psutil.cpu_percent(percpu=True)
+    load = psutil.getloadavg()
+    overall = psutil.cpu_percent()
+    freq = psutil.cpu_freq()
+
+    table = Table.grid(padding=(0, 1), expand=True)
+    table.add_column(justify="right", no_wrap=True)  # label a
+    table.add_column(no_wrap=True)                   # bar a
+    table.add_column(justify="right", no_wrap=True)  # pct a
+    table.add_column(justify="right", no_wrap=True)  # label b
+    table.add_column(no_wrap=True)                   # bar b
+    table.add_column(justify="right", no_wrap=True)  # pct b
+
+    n = len(percents)
+    half = (n + 1) // 2
+    for i in range(half):
+        j = i + half
+        la = Text(f"C{i:02d}", style="bright_cyan")
+        ba = _bar(percents[i], 16)
+        pa = Text(f"{percents[i]:4.0f}%", style=_pct_color(percents[i]))
+        if j < n:
+            lb = Text(f"C{j:02d}", style="bright_cyan")
+            bb = _bar(percents[j], 16)
+            pb = Text(f"{percents[j]:4.0f}%", style=_pct_color(percents[j]))
+        else:
+            lb = bb = pb = Text("")
+        table.add_row(la, ba, pa, lb, bb, pb)
+
+    footer = Text()
+    footer.append("\n  Overall ", style="bright_white")
+    footer.append_text(_bar(overall, 10))
+    footer.append(f"  {overall:.0f}%   ", style=_pct_color(overall))
+    footer.append("Load ", style="bright_black")
+    footer.append(f"{load[0]:.2f}  {load[1]:.2f}  {load[2]:.2f}", style="white")
+    if freq:
+        footer.append(f"   {freq.current / 1000:.2f} GHz", style="bright_black")
+
+    return Panel(
+        Group(table, footer),
+        title="[bold bright_cyan]CPU[/]  AMD Ryzen 9 5900XT  32T",
+        border_style="cyan",
+        box=box.SIMPLE_HEAVY,
+    )
+
+
+def render_gpu(gpu: dict | None) -> Panel:
+    if gpu is None:
+        return Panel(
+            Text("  nvidia-smi unavailable", style="red"),
+            title="[bold bright_green]GPU",
+            border_style="green",
+            box=box.SIMPLE_HEAVY,
+        )
+
+    mem_pct = gpu["mem_used"] / gpu["mem_total"] * 100
+    temp_color = "green" if gpu["temp"] < 70 else "yellow" if gpu["temp"] < 85 else "red"
+
+    t = Text()
+    t.append("\n  Util   ", style="bright_white")
+    t.append_text(_bar(gpu["util"], 26))
+    t.append(f"  {gpu['util']:3d}%\n\n", style=_pct_color(gpu["util"]))
+    t.append("  VRAM   ", style="bright_white")
+    t.append_text(_bar(mem_pct, 26))
+    t.append(f"  {gpu['mem_used']:,} / {gpu['mem_total']:,} MiB\n\n", style=_pct_color(mem_pct))
+    t.append("  Temp   ", style="bright_white")
+    t.append(f"{gpu['temp']}°C", style=temp_color)
+    t.append("        Power   ", style="bright_white")
+    t.append(f"{gpu['power']:.0f} W", style="bright_yellow")
+
+    return Panel(
+        t,
+        title=f"[bold bright_green]GPU[/]  {gpu['name']}",
+        border_style="green",
+        box=box.SIMPLE_HEAVY,
+    )
+
+
+def render_memory() -> Panel:
+    vm = psutil.virtual_memory()
+    used_gb = vm.used / 1024 ** 3
+    total_gb = vm.total / 1024 ** 3
+    pct = vm.percent
+
+    t = Text()
+    t.append("\n  RAM    ", style="bright_white")
+    t.append_text(_bar(pct, 30))
+    t.append(f"  {used_gb:.1f} / {total_gb:.0f} GB   ({pct:.0f}%)", style=_pct_color(pct))
+
+    return Panel(t, title="[bold bright_magenta]Memory", border_style="magenta", box=box.SIMPLE_HEAVY)
+
+
+def render_network() -> Panel:
+    rx, tx = get_net_speed(NET_IFACE)
+
+    t = Text()
+    t.append(f"\n  {NET_IFACE}\n\n", style="bright_cyan")
+    t.append("  ↓  recv   ", style="green")
+    t.append(f"{_fmt_speed(rx):<16}", style="bright_green")
+    t.append("\n  ↑  send   ", style="red")
+    t.append(f"{_fmt_speed(tx)}", style="bright_red")
+
+    return Panel(t, title="[bold bright_blue]Network", border_style="blue", box=box.SIMPLE_HEAVY)
+
+
+def render_lxc(containers: list[dict]) -> Panel:
+    table = Table(
+        box=box.SIMPLE,
+        show_header=True,
+        header_style="bold bright_white",
+        expand=True,
+        padding=(0, 1),
+    )
+    table.add_column("VMID", justify="right", style="bright_cyan", width=5)
+    table.add_column("Name", style="bright_white", min_width=12)
+    table.add_column("Status", width=9)
+    table.add_column("CPU", justify="right", width=6)
+    table.add_column("Memory", width=26)
+    table.add_column("Uptime", width=14)
+
+    for c in containers:
+        status_text = Text(c["status"], style="bright_green" if c["status"] == "running" else "red")
+        if c["stats"]:
+            s = c["stats"]
+            cpu_pct = s["cpu_pct"]
+            mem_gb = s["mem"] / 1024 ** 3
+            max_gb = s["maxmem"] / 1024 ** 3
+            mem_pct = s["mem"] / s["maxmem"] * 100
+            cpu_t = Text(f"{cpu_pct:.1f}%", style=_pct_color(cpu_pct))
+            mem_t = Text()
+            mem_t.append_text(_bar(mem_pct, 10))
+            mem_t.append(f"  {mem_gb:.1f} / {max_gb:.0f} GB", style=_pct_color(mem_pct))
+            uptime = _fmt_uptime(s["uptime"])
+        else:
+            cpu_t = Text("—", style="bright_black")
+            mem_t = Text("—", style="bright_black")
+            uptime = "—"
+
+        table.add_row(c["vmid"], c["name"], status_text, cpu_t, mem_t, uptime)
+
+    return Panel(table, title="[bold bright_yellow]LXC Containers", border_style="yellow", box=box.SIMPLE_HEAVY)
+
+# ── layout ───────────────────────────────────────────────────────────────────────
+
+def make_layout() -> Layout:
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header", size=1),
+        Layout(name="top", ratio=5),
+        Layout(name="mid", size=6),
+        Layout(name="bottom", ratio=2),
+    )
+    layout["top"].split_row(
+        Layout(name="cpu", ratio=3),
+        Layout(name="gpu", ratio=2),
+    )
+    layout["mid"].split_row(
+        Layout(name="memory", ratio=3),
+        Layout(name="network", ratio=2),
+    )
+    return layout
+
+
+def update(layout: Layout, lxc_cache: list, lxc_tick: list[int], gpu_cache: list) -> None:
+    # GPU refresh every 2s (nvidia-smi adds latency)
+    if lxc_tick[0] % 2 == 0:
+        gpu_cache[0] = get_gpu()
+
+    # LXC stats refresh every 5s (pvesh calls are slow)
+    lxc_tick[0] += 1
+    if lxc_tick[0] >= 5:
+        lxc_cache[:] = get_lxc_containers()
+        lxc_tick[0] = 0
+
+    layout["header"].update(render_header())
+    layout["cpu"].update(render_cpu())
+    layout["gpu"].update(render_gpu(gpu_cache[0]))
+    layout["memory"].update(render_memory())
+    layout["network"].update(render_network())
+    layout["bottom"].update(render_lxc(lxc_cache))
+
+
+def main() -> None:
+    console = Console()
+
+    # Prime measurements (first psutil calls return 0)
+    psutil.cpu_percent(percpu=True)
+    get_net_speed(NET_IFACE)
+    time.sleep(1.0)
+
+    layout = make_layout()
+    lxc_cache = get_lxc_containers()
+    gpu_cache = [get_gpu()]
+    lxc_tick = [0]
+
+    with Live(layout, console=console, refresh_per_second=2, screen=True):
+        while True:
+            update(layout, lxc_cache, lxc_tick, gpu_cache)
+            time.sleep(REFRESH)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
