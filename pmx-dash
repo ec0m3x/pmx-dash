@@ -266,13 +266,28 @@ def render_memory() -> Panel:
     t = Text()
     t.append("\n  RAM    ", style="bright_white")
     t.append_text(_bar(pct, 30))
-    t.append(f"  {used_gb:.1f} / {total_gb:.0f} GB   ({pct:.0f}%)", style=_pct_color(pct))
+    t.append(f"  {used_gb:.1f} / {total_gb:.0f} GB   ({pct:.0f}%)\n", style=_pct_color(pct))
 
-    return Panel(t, title="[bold bright_magenta]Memory", border_style="magenta", box=box.SIMPLE_HEAVY)
+    for part in psutil.disk_partitions():
+        try:
+            usage = psutil.disk_usage(part.mountpoint)
+            if usage.total < 1024 ** 3:
+                continue
+            used_gb_d = usage.used / 1024 ** 3
+            total_gb_d = usage.total / 1024 ** 3
+            pct_d = usage.percent
+            t.append(f"\n  {part.mountpoint:<7} ", style="bright_white")
+            t.append_text(_bar(pct_d, 30))
+            t.append(f"  {used_gb_d:.1f} / {total_gb_d:.0f} GB   ({pct_d:.0f}%)", style=_pct_color(pct_d))
+        except (PermissionError, OSError):
+            pass
+
+    return Panel(t, title="[bold bright_magenta]Memory & Disk", border_style="magenta", box=box.SIMPLE_HEAVY)
 
 
 def render_network() -> Panel:
     rx, tx = get_net_speed(NET_IFACE)
+    stats = psutil.net_io_counters(pernic=True).get(NET_IFACE)
 
     t = Text()
     t.append(f"\n  {NET_IFACE}\n\n", style="bright_cyan")
@@ -280,6 +295,9 @@ def render_network() -> Panel:
     t.append(f"{_fmt_speed(rx):<16}", style="bright_green")
     t.append("\n  ↑  send   ", style="red")
     t.append(f"{_fmt_speed(tx)}", style="bright_red")
+    if stats:
+        t.append(f"\n\n  Total ↓  {_fmt_bytes(stats.bytes_recv):<14}", style="bright_black")
+        t.append(f"  ↑  {_fmt_bytes(stats.bytes_sent)}", style="bright_black")
 
     return Panel(t, title="[bold bright_blue]Network", border_style="blue", box=box.SIMPLE_HEAVY)
 
@@ -372,7 +390,7 @@ def make_layout() -> Layout:
     layout.split_column(
         Layout(name="header", size=1),
         Layout(name="top", ratio=5),
-        Layout(name="mid", size=6),
+        Layout(name="mid", size=5),
         Layout(name="bottom", ratio=3),
     )
     layout["top"].split_row(
